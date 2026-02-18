@@ -241,6 +241,66 @@ def get_batch_domains(session: requests.Session, rid: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Input loading — CSV and plain TXT domain list
+# ══════════════════════════════════════════════════════════════════════════════
+def _clean_domain(raw: str) -> str:
+    """Strip protocol prefix and trailing slashes from a raw domain string."""
+    raw = raw.strip()
+    for pfx in ("https://", "http://"):
+        if raw.lower().startswith(pfx):
+            raw = raw[len(pfx):]
+    return raw.rstrip("/").strip()
+
+
+def load_input(
+    input_path: Path,
+    domain_col: str,
+) -> tuple[list[str], list[dict], str]:
+    """
+    Detect input format and load rows.
+
+    TXT mode (.txt extension) — plain list of domains, one per line.
+      • Empty lines and lines starting with '#' are skipped.
+      • 'http(s)://' prefixes and trailing slashes are stripped automatically.
+      Returns synthetic rows: [{domain_col: "example.com"}, …]
+
+    CSV mode (any other extension) — standard behaviour:
+      must contain a column matching --domain-col (case-insensitive).
+
+    Returns (input_fieldnames, all_input_rows, actual_col).
+    """
+    if input_path.suffix.lower() == ".txt":
+        domains: list[str] = []
+        with open(input_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                domain = _clean_domain(line)
+                if domain:
+                    domains.append(domain)
+        col  = domain_col
+        rows = [{col: d} for d in domains]
+        log.info("TXT mode: loaded %d domains from %s", len(domains), input_path)
+        return [col], rows, col
+
+    # CSV mode
+    with open(input_path, encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        input_fieldnames: list[str] = list(reader.fieldnames or [])
+        all_input_rows: list[dict]  = list(reader)
+
+    actual_col = find_col(input_fieldnames, domain_col)
+    if actual_col is None:
+        log.error("Domain column '%s' not found. Available: %s",
+                  domain_col, input_fieldnames)
+        sys.exit(1)
+
+    log.info("CSV mode: loaded %d rows from %s", len(all_input_rows), input_path)
+    return input_fieldnames, all_input_rows, actual_col
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CSV helpers
 # ══════════════════════════════════════════════════════════════════════════════
 def find_col(fieldnames: list[str], name: str) -> str | None:
@@ -675,7 +735,9 @@ def main() -> None:
         description="Keys.so batch domain parser — true pipeline mode.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--input",      required=True,  help="Input CSV path")
+    parser.add_argument("--input",      default=None,
+                        help="Input file path. If omitted, auto-detects domains.txt or domains.csv "
+                             "in the current directory")
     parser.add_argument("--output",     default="output/donors_keyso.csv",
                         help="Output CSV path")
     parser.add_argument("--base",       default="msk",  help="Keys.so region base")
@@ -684,7 +746,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=100,
                         help="Domains per API batch (max ~100; 200+ returns HTTP 410)")
     parser.add_argument("--domain-col", default="Домен",
-                        help="Input CSV column with domain names")
+                        help="CSV column with domain names (ignored for .txt input)")
     parser.add_argument("--no-completion-check", action="store_true",
                         help="Skip completion check and error retry (useful for quick tests)")
     args = parser.parse_args()
@@ -697,20 +759,29 @@ def main() -> None:
         log.error("KEYSSO_TOKEN not set. Add it to .env file.")
         sys.exit(1)
 
+    # ── Resolve input file ────────────────────────────────────────────────────
+    if args.input is None:
+        if Path("domains.txt").exists():
+            args.input = "domains.txt"
+        elif Path("domains.csv").exists():
+            args.input = "domains.csv"
+        else:
+            log.error(
+                "Input file not found. "
+                "Create domains.txt (one domain per line) or domains.csv "
+                "in the current directory, or pass --input <path>."
+            )
+            sys.exit(1)
+
     input_path  = Path(args.input)
     output_path = Path(args.output)
 
-    # ── Read input CSV ────────────────────────────────────────────────────────
-    with open(input_path, encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        input_fieldnames: list[str] = list(reader.fieldnames or [])
-        all_input_rows: list[dict]  = list(reader)
-
-    actual_col = find_col(input_fieldnames, args.domain_col)
-    if actual_col is None:
-        log.error("Domain column '%s' not found. Available: %s",
-                  args.domain_col, input_fieldnames)
+    if not input_path.exists():
+        log.error("Input file not found: %s", input_path)
         sys.exit(1)
+
+    # ── Read input (CSV or TXT domain list) ──────────────────────────────────
+    input_fieldnames, all_input_rows, actual_col = load_input(input_path, args.domain_col)
 
     # ── Output headers ────────────────────────────────────────────────────────
     keyso_headers = [_col(c) for c in KEYSO_METRICS + SERVICE_COLS]
